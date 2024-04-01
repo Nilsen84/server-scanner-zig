@@ -53,44 +53,33 @@ fn tryPing(allocator: std.mem.Allocator, stream: std.net.Stream) ![]const u8 {
     return str;
 }
 
-fn save(allocator: std.mem.Allocator, addr: std.net.Ip4Address, response: []const u8) !void {
+fn save(addr: std.net.Ip4Address, response: *std.json.ObjectMap) !void {
     var buf: ["255.255.255.255.json".len + 1]u8 = undefined;
     const filename = std.fmt.bufPrintZ(&buf, "{}.json", .{ipFormatter(addr)}) catch unreachable;
     const file = try root.output_directory.createFileZ(filename, .{});
-
-    var json = std.json.parseFromSlice(std.json.Value, allocator, response, .{ .allocate = .alloc_if_needed }) catch |err| {
-        std.debug.print("failed to parse json - writing raw data: {s}\n", .{@errorName(err)});
-        try file.writeAll(response);
-        return;
-    };
-    defer json.deinit();
+    defer file.close();
 
     var jws = std.json.writeStream(file.writer(), .{ .whitespace = .indent_4 });
     defer jws.deinit();
 
-    switch (json.value) {
-        .object => |*map| {
-            try jws.beginObject();
-            try jws.objectField("address");
-            try jws.write(buf[0 .. filename.len - 5]);
+    try jws.beginObject();
+    try jws.objectField("address");
+    try jws.write(buf[0 .. filename.len - 5]);
 
-            inline for (.{ "version", "description", "players" }) |key| {
-                if (map.fetchSwapRemove(key)) |entry| {
-                    try jws.objectField(entry.key);
-                    try jws.write(entry.value);
-                }
-            }
-
-            var it = map.iterator();
-            while (it.next()) |entry| {
-                try jws.objectField(entry.key_ptr.*);
-                try jws.write(entry.value_ptr.*);
-            }
-
-            try jws.endObject();
-        },
-        else => |val| try jws.write(val),
+    inline for (.{ "version", "players", "description" }) |key| {
+        if (response.fetchSwapRemove(key)) |entry| {
+            try jws.objectField(entry.key);
+            try jws.write(entry.value);
+        }
     }
+
+    var it = response.iterator();
+    while (it.next()) |entry| {
+        try jws.objectField(entry.key_ptr.*);
+        try jws.write(entry.value_ptr.*);
+    }
+
+    try jws.endObject();
 }
 
 pub fn ping(allocator: std.mem.Allocator, addr: std.net.Ip4Address, sock: std.posix.socket_t) void {
@@ -103,10 +92,23 @@ pub fn ping(allocator: std.mem.Allocator, addr: std.net.Ip4Address, sock: std.po
     };
     defer allocator.free(response);
 
-    save(allocator, addr, response) catch |err| {
-        std.debug.print("failed to save reponse from {}: {s}\n", .{ ipFormatter(addr), @errorName(err) });
+    var json = std.json.parseFromSlice(std.json.Value, allocator, response, .{ .allocate = .alloc_if_needed }) catch |err| {
+        std.debug.print("failed to parse response from {}: {s}\n", .{ ipFormatter(addr), @errorName(err) });
         return;
     };
+    defer json.deinit();
 
-    std.debug.print("successfully pinged {}\n", .{ipFormatter(addr)});
+    const obj = switch (json.value) {
+        .object => |*obj| obj,
+        else => |val| {
+            std.debug.print("json {s} returned from {}: expected object", .{ @tagName(val), ipFormatter(addr) });
+            return;
+        },
+    };
+
+    if (save(addr, obj)) {
+        std.debug.print("successfully pinged {}\n", .{ipFormatter(addr)});
+    } else |err| {
+        std.debug.print("failed to save reponse from {}: {s}\n", .{ ipFormatter(addr), @errorName(err) });
+    }
 }
